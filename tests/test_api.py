@@ -1600,3 +1600,228 @@ def test_legacy_database_upgrades_with_dependency_table_and_keeps_data(tmp_path)
     assert created is False
     assert rec["payload"] == {"k": 0}
     db.close()
+
+# ---------- 阻塞根因定位：GET /events/{event_id}/blocker-roots ----------
+
+
+def get_blocker_roots(client, event_id: str):
+    return client.get(f"/events/{event_id}/blocker-roots")
+
+
+def test_blocker_roots_not_found_returns_404(client):
+    r = get_blocker_roots(client, "ghost")
+    assert r.status_code == 404
+    assert r.json() == {"detail": "event not found"}
+
+
+def test_blocker_roots_pending_without_dependencies_is_ackable(client):
+    post_event(client, event_with_deps("a"))
+    r = get_blocker_roots(client, "a")
+    assert r.status_code == 200
+    assert r.json() == {
+        "event_id": "a",
+        "status": "pending",
+        "can_ack": True,
+        "root_blockers": [],
+    }
+
+
+def test_blocker_roots_acked_event_not_ackable_and_empty(client):
+    post_event(client, event_with_deps("a"))
+    client.post("/events/a/ack")
+    r = get_blocker_roots(client, "a")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "acked"
+    assert body["can_ack"] is False
+    assert body["root_blockers"] == []
+
+
+def test_blocker_roots_follows_chain_to_uppermost_pending(client):
+    # c -> b -> a（a 无前置）：c 的直接 blocker 是 b，真正根因是 a
+    _chain(client, "c", "b", "a")
+    r = get_blocker_roots(client, "c")
+    assert r.status_code == 200
+    assert r.json() == {
+        "event_id": "c",
+        "status": "pending",
+        "can_ack": False,
+        "root_blockers": [{"event_id": "a", "path": ["c", "b", "a"]}],
+    }
+    # b 的根因同样是 a，路径只含 b -> a
+    body = get_blocker_roots(client, "b").json()
+    assert body["can_ack"] is False
+    assert body["root_blockers"] == [{"event_id": "a", "path": ["b", "a"]}]
+
+
+def test_blocker_roots_diamond_merges_shared_root(client):
+    # d -> b,c -> a：两分支汇合于同一根因，只返回一次
+    post_batch(
+        client,
+        [
+            event_with_deps("d", ["b", "c"]),
+            event_with_deps("b", ["a"]),
+            event_with_deps("c", ["a"]),
+            event_with_deps("a"),
+        ],
+    )
+    body = get_blocker_roots(client, "d").json()
+    assert body["can_ack"] is False
+    assert body["root_blockers"] == [{"event_id": "a", "path": ["d", "b", "a"]}]
+
+
+def test_blocker_roots_multiple_roots_sorted_by_root_id(client):
+    # t -> b,c；b -> a；c 无前置。根因为 a（经 b）与 c 自身
+    post_batch(
+        client,
+        [
+            event_with_deps("t", ["b", "c"]),
+            event_with_deps("b", ["a"]),
+            event_with_deps("c"),
+            event_with_deps("a"),
+        ],
+    )
+    body = get_blocker_roots(client, "t").json()
+    assert body["root_blockers"] == [
+        {"event_id": "a", "path": ["t", "b", "a"]},
+        {"event_id": "c", "path": ["t", "c"]},
+    ]
+
+
+def test_blocker_roots_prefers_shortest_path(client):
+    # t -> m -> a 与 t -> a 并存：选边数最少的直连路径
+    post_batch(
+        client,
+        [
+            event_with_deps("t", ["m", "a"]),
+            event_with_deps("m", ["a"]),
+            event_with_deps("a"),
+        ],
+    )
+    body = get_blocker_roots(client, "t").json()
+    assert body["root_blockers"] == [{"event_id": "a", "path": ["t", "a"]}]
+
+
+def test_blocker_roots_equal_length_uses_full_path_lexicographic_order(client):
+    # t -> a1,a2；a1 -> z，a2 -> z：到根因 z 两条等长路径，
+    # 整条 ID 序列字典序取 ["t","a1","z"]
+    post_batch(
+        client,
+        [
+            event_with_deps("t", ["a1", "a2"]),
+            event_with_deps("a1", ["z"]),
+            event_with_deps("a2", ["z"]),
+            event_with_deps("z"),
+        ],
+    )
+    body = get_blocker_roots(client, "t").json()
+    assert body["root_blockers"] == [{"event_id": "z", "path": ["t", "a1", "z"]}]
+
+
+def test_blocker_roots_lexicographic_decision_later_in_path(client):
+    # t -> s（公共前缀）；s -> m0,m1；m0 -> z，m1 -> z。
+    # 两条等长路径 ["t","s","m0","z"] / ["t","s","m1","z"] 共享前两跳，
+    # 在第三跳按 m0 < m1 决定，与首跳之后立即分叉无关
+    post_batch(
+        client,
+        [
+            event_with_deps("t", ["s"]),
+            event_with_deps("s", ["m0", "m1"]),
+            event_with_deps("m1", ["z"]),
+            event_with_deps("m0", ["z"]),
+            event_with_deps("z"),
+        ],
+    )
+    body = get_blocker_roots(client, "t").json()
+    assert body["root_blockers"] == [
+        {"event_id": "z", "path": ["t", "s", "m0", "z"]}
+    ]
+
+
+def test_blocker_roots_acked_dependencies_do_not_block(client):
+    # t -> ready, blocked；ready 已 ack、blocked -> a 仍 pending
+    post_batch(
+        client,
+        [
+            event_with_deps("t", ["ready", "blocked"]),
+            event_with_deps("ready"),
+            event_with_deps("blocked", ["a"]),
+            event_with_deps("a"),
+        ],
+    )
+    client.post("/events/ready/ack")
+    body = get_blocker_roots(client, "t").json()
+    assert body["can_ack"] is False
+    # 追溯不走 ready 边；唯一根因沿 blocked 到 a
+    assert body["root_blockers"] == [
+        {"event_id": "a", "path": ["t", "blocked", "a"]}
+    ]
+
+
+def test_blocker_roots_pending_node_with_only_acked_upstream_is_terminal_root(client):
+    # t -> p；p -> a，a 已 ack：p 没有 pending 出边，p 自身即根因
+    post_batch(
+        client,
+        [
+            event_with_deps("t", ["p"]),
+            event_with_deps("p", ["a"]),
+            event_with_deps("a"),
+        ],
+    )
+    client.post("/events/a/ack")
+    body = get_blocker_roots(client, "t").json()
+    assert body["root_blockers"] == [{"event_id": "p", "path": ["t", "p"]}]
+    # p 本身：前置已齐，可确认，根因为空
+    p_body = get_blocker_roots(client, "p").json()
+    assert p_body["can_ack"] is True
+    assert p_body["root_blockers"] == []
+
+
+def test_blocker_roots_becomes_ackable_after_chain_acked(client):
+    _chain(client, "c", "b", "a")
+    assert get_blocker_roots(client, "c").json()["can_ack"] is False
+    client.post("/events/a/ack")
+    body = get_blocker_roots(client, "c").json()
+    assert body["can_ack"] is False
+    assert body["root_blockers"] == [{"event_id": "b", "path": ["c", "b"]}]
+    client.post("/events/b/ack")
+    body = get_blocker_roots(client, "c").json()
+    assert body["can_ack"] is True
+    assert body["root_blockers"] == []
+    # 确认后再查：已 ack、不可再确认、根因为空
+    assert client.post("/events/c/ack").status_code == 200
+    body = get_blocker_roots(client, "c").json()
+    assert body["status"] == "acked"
+    assert body["can_ack"] is False
+    assert body["root_blockers"] == []
+
+
+def test_blocker_roots_shared_root_across_unequal_length_paths(client):
+    # t -> b,c；b -> q -> z；c -> z：同一根因 z，最短路径为 t,c,z；
+    # 中间节点 q 虽 pending，但不是根因（仍有 pending 前置 z）
+    post_batch(
+        client,
+        [
+            event_with_deps("t", ["b", "c"]),
+            event_with_deps("b", ["q"]),
+            event_with_deps("q", ["z"]),
+            event_with_deps("c", ["z"]),
+            event_with_deps("z"),
+        ],
+    )
+    body = get_blocker_roots(client, "t").json()
+    assert [r["event_id"] for r in body["root_blockers"]] == ["z"]
+    assert body["root_blockers"][0]["path"] == ["t", "c", "z"]
+
+
+def test_store_blocker_roots_read_does_not_mutate(store):
+    store.create_event("a", "t", {}, source=SOURCE, nonce="br0")
+    store.create_event("b", "t", {}, source=SOURCE, nonce="br1", depends_on=["a"])
+    result = store.get_blocker_roots("b")
+    assert result["can_ack"] is False
+    assert result["roots"] == [{"event_id": "a", "path": ["b", "a"]}]
+    assert result["event"]["status"] == "pending"
+    # 只读：状态未被改变
+    assert store.get_event("b")["status"] == "pending"
+    with pytest.raises(EventNotFoundError):
+        store.get_blocker_roots("ghost")

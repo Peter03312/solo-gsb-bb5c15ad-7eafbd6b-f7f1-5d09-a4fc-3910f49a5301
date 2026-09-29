@@ -25,6 +25,7 @@
 - **GET /events/ready** 沿用相同游标规则，只列出**全部依赖均已 ack 的 pending 事件**；前置事件确认后后继**立即解锁**
 - **POST /events/{event_id}/ack** 单条确认（幂等，重复确认返回当前状态）；尚有未完成依赖时返回 **409** 与 `blockers` 列表
 - **POST /events/ack-batch** 批量确认（1~100 个 event_id，无需签名头）：按首次出现顺序去重、按原输入顺序返回每项结果；**允许先列后继、再列前置**，服务端在同一 SQLite 写事务内按依赖顺序确认；已确认事件幂等。任一 ID 不存在（**404**）或前置仍 pending 且不在本批待确认集合中（**409**，给出阻塞项与 `blockers`）时，可定位到原始下标且**整批状态不变**
+- **GET /events/{event_id}/blocker-roots** 阻塞根因定位：事件依赖链较长时，沿 **pending 依赖边**逐层追溯真正挡住确认的**最上游未确认前置**，返回目标当前状态、`can_ack` 以及每个根因的 ID 与从目标到它的路径（含两端）。汇合分支共享的同一根因只返回一次；多条路径选边数最少者，等长时按整条 ID 序列字典序选定，结果按根因 ID 排序
 - **GET /events/{event_id}** 查询单条事件
 - 事件、处理状态（`pending` / `acked`）与依赖边持久化到 SQLite，**启动时自动建表**；含 `used_nonces` 防重放表与 `event_dependencies` 依赖表，升级已有数据库时只增量补表、不动旧数据
 
@@ -171,6 +172,7 @@ curl -i -X POST http://localhost:8000/events \
 | 依赖校验失败：引用不存在、自依赖、批内依赖环（单条与批量均整批零写入） | 422 |
 | 确认事件时仍有未完成（pending）的前置依赖 | 409，返回 `blockers` |
 | 批量确认含不存在的 event_id | 404，返回 `missing`（含原始下标），整批状态不变 |
+| 查询单条事件 / 阻塞根因时 event_id 不存在 | 404，`{"detail":"event not found"}` |
 | 批量确认中前置仍 pending 且不在本批 | 409，返回 `blocked`（每项含原始下标与 `blockers`），整批状态不变 |
 | 批量确认 `event_ids` 为空或超过 100 个、含空字符串 | 422 |
 
@@ -183,6 +185,7 @@ curl -i -X POST http://localhost:8000/events \
 | GET | `/events?limit=&cursor=&status=` | 时间游标分页查询，`limit` 默认 50、最大 200 |
 | GET | `/events/ready?limit=&cursor=` | 只列全部依赖均已 ack 的 pending 事件，游标规则同 `/events` |
 | GET | `/events/{event_id}` | 查询单条事件，不存在 `404` |
+| GET | `/events/{event_id}/blocker-roots` | 阻塞根因定位：返回目标 `status` / `can_ack` 与最上游未确认前置的 ID 及追溯路径，不存在 `404` |
 | POST | `/events/{event_id}/ack` | 确认事件（幂等），不存在 `404`，尚有未完成依赖 `409`（含 `blockers`） |
 | POST | `/events/ack-batch` | 批量确认 1~100 个 event_id（无需签名头）。先列后继再列前置亦可，事务内按依赖顺序确认，按原输入顺序返回；不存在 `404`、外部前置未确认 `409`（均含原始下标，整批状态不变），入参不合法 `422` |
 | GET | `/healthz` | 健康检查 |
@@ -400,6 +403,69 @@ curl -X POST http://localhost:8000/events/ack-batch \
 
 只要阻塞项也列在本批（任意位置），即按依赖顺序解锁——把上面的 `evt-002` 补进请求（`["evt-003", "evt-001", "evt-002"]`）即可整批成功。`event_ids` 为空、超过 100 个或元素为空字符串返回 `422`。
 
+### 阻塞根因定位
+
+依赖链较长时，单条确认返回的 `blockers` 只是**直接**前置；要定位真正挡住确认的最上游原因，使用：
+
+```bash
+curl http://localhost:8000/events/evt-003/blocker-roots
+```
+
+无需签名头。响应包含目标当前状态、是否可确认，以及每个**最上游未确认前置事件（阻塞根因）**的 ID 与从目标到它的路径（含两端）：
+
+```json
+{
+  "event_id": "evt-003",
+  "status": "pending",
+  "can_ack": false,
+  "root_blockers": [
+    {"event_id": "evt-001", "path": ["evt-003", "evt-002", "evt-001"]}
+  ]
+}
+```
+
+追溯规则：
+
+- **只沿 pending 前置边追溯**：依赖边指向的前置若已 ack，该边不构成阻塞、不在此方向继续追溯；已确认前置永远不会出现在结果里。
+- **根因**：pending 子图上不再有 pending 前置的节点（最上游未确认事件）。上例中 `evt-003 → evt-002 → evt-001` 全部 pending，`evt-001` 无前置，故唯一根因是 `evt-001`。
+- **汇合分支去重**：多个分支汇合到同一根因时只返回一次。例如 `d → b,c → a` 中 `d` 的根因只有一个 `a`，路径为 `["d","b","a"]` 或 `["d","c","a"]` 中的优胜者。
+- **多路径选优**：目标到同一根因存在多条路径时，选**边数最少**的；边数相同则按**整条 ID 序列的字典序**（逐跳比较）选定。
+- **结果排序**：`root_blockers` 按根因 `event_id` 字典序升序。
+- 响应为只读查询，不改变任何状态，也不影响入箱、`/events/ready` 与确认接口的行为。
+
+不同目标状态下的返回：
+
+| 目标状态 | `can_ack` | `root_blockers` |
+| --- | --- | --- |
+| 不存在 | — | 返回 `404 {"detail":"event not found"}` |
+| `acked`（已确认） | `false`（不可再确认） | `[]` |
+| `pending` 且无 pending 前置（直接可确认） | `true` | `[]` |
+| `pending` 且存在 pending 前置 | `false` | 最上游根因及路径列表 |
+
+典型用法：当 `POST /events/{event_id}/ack` 返回 `409 blockers` 时，调用本接口拿到全部根因，把根因（或根因到目标之间的整条链）确认后即可解锁目标；也可以把返回的路径直接作为 `/events/ack-batch` 的输入（批内允许先列后继再列前置，顺序任意）：
+
+```bash
+# 假设根因路径为 evt-003 -> evt-002 -> evt-001，一次性按依赖顺序确认
+curl -X POST http://localhost:8000/events/ack-batch \
+  -H 'Content-Type: application/json' \
+  -d '{"event_ids": ["evt-003", "evt-002", "evt-001"]}'
+```
+
+Python 调用示例：
+
+```python
+import json, urllib.request
+
+with urllib.request.urlopen(
+    "http://localhost:8000/events/evt-003/blocker-roots"
+) as resp:
+    info = json.load(resp)
+
+print(info["status"], info["can_ack"])
+for root in info["root_blockers"]:
+    print("root:", root["event_id"], "path:", " -> ".join(root["path"]))
+```
+
 ## 幂等、防重放与并发设计
 
 - **签名先于解析**：入箱路由先读取原始请求体完成 HMAC 校验，再解析 JSON。这样即使请求体是畸形 JSON，鉴权失败仍返回 401（而非让 422 绕过验签），且鉴权阶段完全不触碰数据库，天然零写入。
@@ -437,7 +503,7 @@ environment:
 ```bash
 pip install -r requirements-dev.txt
 export WEBHOOK_SECRETS_JSON='{"demo":{"current":"dev-only-secret-change-me"}}'
-pytest tests/ -q                 # 103 个测试：签名/重放/密钥轮换、幂等、409、分页、依赖门禁（缺失/自依赖/环）、就绪解锁、ack 并发、批量提交/批量确认原子性、旧库迁移、持久化
+pytest tests/ -q                 # 117 个测试：签名/重放/密钥轮换、幂等、409、分页、依赖门禁（缺失/自依赖/环）、就绪解锁、ack 并发、批量提交/批量确认原子性、阻塞根因追溯、旧库迁移、持久化
 DATABASE_PATH=./events.db uvicorn app.main:app --reload --port 8000
 ```
 
@@ -447,7 +513,7 @@ DATABASE_PATH=./events.db uvicorn app.main:app --reload --port 8000
 app/
   main.py    # FastAPI 路由、签名头依赖与请求模型（验签后手动解析原始体）
   auth.py    # WEBHOOK_SECRETS_JSON 解析、HMAC-SHA256 验签、时间窗与轮换宽限
-  store.py   # nonce 登记 + 幂等写入与依赖校验（同一写事务）、依赖环检测、游标分页、就绪队列、门禁确认与批量拓扑确认（存储层）
+  store.py   # nonce 登记 + 幂等写入与依赖校验（同一写事务）、依赖环检测、游标分页、就绪队列、门禁确认与批量拓扑确认、阻塞根因 pending 边 BFS 追溯（存储层）
   db.py      # SQLite 连接、WAL、自动建表（events / used_nonces / event_dependencies）
 tests/
   test_api.py
