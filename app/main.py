@@ -92,6 +92,24 @@ class AckBatchOut(BaseModel):
     items: list[EventOut]
 
 
+class BlockingRootOut(BaseModel):
+    # 最上游未确认前置事件（pending 且自身没有 pending 前置）的 ID
+    event_id: str
+    # 从目标到该根因的完整路径（含目标与根因两端），只含 pending 事件
+    path: list[str]
+
+
+class BlockingRootsOut(BaseModel):
+    event_id: str
+    status: Literal["pending", "acked"]
+    # 当前是否可确认：仅当目标 pending 且没有任何 pending 前置时为 true；
+    # 已确认事件不可再确认，恒为 false
+    confirmable: bool
+    # 汇合分支的同一根因只出现一次；按根因 event_id 排序，
+    # 多条路径取边数最少者，等长时按整条 ID 序列字典序取最小
+    root_causes: list[BlockingRootOut] = Field(default_factory=list)
+
+
 @dataclass(frozen=True)
 class AuthenticatedRequest:
     """验签通过后的请求上下文。"""
@@ -160,7 +178,7 @@ async def lifespan(app: FastAPI):
     db.close()
 
 
-app = FastAPI(title="Webhook Inbox", version="1.3.0", lifespan=lifespan)
+app = FastAPI(title="Webhook Inbox", version="1.4.0", lifespan=lifespan)
 
 
 def get_store(request: Request) -> EventStore:
@@ -469,6 +487,23 @@ def ack_events_batch(
 def get_event(event_id: str, store: EventStore = Depends(get_store)):
     try:
         return store.get_event(event_id)
+    except EventNotFoundError:
+        raise HTTPException(status_code=404, detail="event not found")
+
+
+@app.get("/events/{event_id}/root-causes", response_model=BlockingRootsOut)
+def get_blocking_roots(event_id: str, store: EventStore = Depends(get_store)):
+    """定位当前真正挡住某条事件确认的最上游未确认前置（根因）。
+
+    只沿 pending 前置边追溯，已确认前置不构成阻塞（其上游也不追溯）。
+    返回目标当前状态、是否可确认，以及每个根因的 ID 与从目标到它的
+    路径（含两端）；汇合分支的同一根因只返回一次，多条路径选边数最少者，
+    等长时按整条 ID 序列字典序选定，结果按根因 ID 排序。目标不存在返回
+    404；目标已确认时不可再确认且根因为空；待确认但没有未确认前置时
+    可确认且根因为空。
+    """
+    try:
+        return store.get_blocking_roots(event_id)
     except EventNotFoundError:
         raise HTTPException(status_code=404, detail="event not found")
 

@@ -1330,6 +1330,262 @@ def test_ack_batch_does_not_require_signature_headers(client):
     assert r.status_code == 200
 
 
+# ---------- 依赖门禁：根因追溯 GET /events/{event_id}/root-causes ----------
+
+
+def get_root_causes(client, event_id: str):
+    return client.get(f"/events/{event_id}/root-causes")
+
+
+def test_root_causes_not_found_returns_404(client):
+    r = get_root_causes(client, "ghost")
+    assert r.status_code == 404
+    assert r.json() == {"detail": "event not found"}
+
+
+def test_root_causes_pending_without_dependencies_is_confirmable(client):
+    post_event(client, event_with_deps("a", []))
+    r = get_root_causes(client, "a")
+    assert r.status_code == 200
+    assert r.json() == {
+        "event_id": "a",
+        "status": "pending",
+        "confirmable": True,
+        "root_causes": [],
+    }
+
+
+def test_root_causes_acked_target_is_not_confirmable_and_empty(client):
+    _chain(client, "b", "a")
+    client.post("/events/a/ack")
+    client.post("/events/b/ack")
+    r = get_root_causes(client, "b")
+    assert r.status_code == 200
+    assert r.json() == {
+        "event_id": "b",
+        "status": "acked",
+        "confirmable": False,
+        "root_causes": [],
+    }
+
+
+def test_root_causes_chain_points_at_leaf_with_full_path(client):
+    _chain(client, "c", "b", "a")  # c -> b -> a，根因 a
+    r = get_root_causes(client, "c")
+    assert r.status_code == 200
+    assert r.json() == {
+        "event_id": "c",
+        "status": "pending",
+        "confirmable": False,
+        "root_causes": [{"event_id": "a", "path": ["c", "b", "a"]}],
+    }
+    # 中间节点：路径从该节点自身开始
+    assert get_root_causes(client, "b").json() == {
+        "event_id": "b",
+        "status": "pending",
+        "confirmable": False,
+        "root_causes": [{"event_id": "a", "path": ["b", "a"]}],
+    }
+
+
+def test_root_causes_diamond_converges_to_single_root(client):
+    # d -> b -> a，d -> c -> a：两条分支汇合于同一根因 a，只返回一次
+    events = [
+        event_with_deps("d", ["b", "c"]),
+        event_with_deps("b", ["a"]),
+        event_with_deps("c", ["a"]),
+        event_with_deps("a", []),
+    ]
+    post_batch(client, events)
+    body = get_root_causes(client, "d").json()
+    assert body["confirmable"] is False
+    assert body["root_causes"] == [{"event_id": "a", "path": ["d", "b", "a"]}]
+
+
+def test_root_causes_multiple_independent_roots_sorted_by_id(client):
+    # z 依赖 b、a（均为无依赖 pending）：两个独立根因，按根因 ID 排序
+    post_event(client, event_with_deps("a", []))
+    post_event(client, event_with_deps("b", []))
+    post_event(client, event_with_deps("z", ["b", "a"]))
+    assert get_root_causes(client, "z").json()["root_causes"] == [
+        {"event_id": "a", "path": ["z", "a"]},
+        {"event_id": "b", "path": ["z", "b"]},
+    ]
+
+
+def test_root_causes_walks_only_pending_edges(client):
+    # d -> b -> a；另 d -> c（无依赖）。ack b 后 a 已不沿 pending 边可达，
+    # 唯一根因变为 c；已 ack 前置 b 及其上游 a 都不再追溯
+    events = [
+        event_with_deps("d", ["b", "c"]),
+        event_with_deps("b", ["a"]),
+        event_with_deps("a", []),
+        event_with_deps("c", []),
+    ]
+    post_batch(client, events)
+    client.post("/events/a/ack")
+    client.post("/events/b/ack")
+    body = get_root_causes(client, "d").json()
+    assert body["status"] == "pending"
+    assert body["confirmable"] is False
+    assert body["root_causes"] == [{"event_id": "c", "path": ["d", "c"]}]
+
+
+def test_root_causes_becomes_confirmable_as_prerequisites_are_acked(client):
+    _chain(client, "c", "b", "a")
+    body = get_root_causes(client, "c").json()
+    assert body["confirmable"] is False
+    assert [rc["event_id"] for rc in body["root_causes"]] == ["a"]
+
+    client.post("/events/a/ack")
+    body = get_root_causes(client, "c").json()
+    assert body["confirmable"] is False
+    assert body["root_causes"] == [{"event_id": "b", "path": ["c", "b"]}]
+
+    client.post("/events/b/ack")
+    body = get_root_causes(client, "c").json()
+    assert body["confirmable"] is True
+    assert body["root_causes"] == []
+    # 可确认时单条 ack 立即成功
+    assert client.post("/events/c/ack").status_code == 200
+
+
+def test_root_causes_selects_shortest_path(client):
+    # g 依赖 a1（直接）、f（f -> a1）、q（q -> r -> a1）：同一根因 a1
+    # 有长度 1/2/3 三条路径，选边数最少的 ["g", "a1"]
+    events = [
+        event_with_deps("g", ["f", "a1", "q"]),
+        event_with_deps("f", ["a1"]),
+        event_with_deps("q", ["r"]),
+        event_with_deps("r", ["a1"]),
+        event_with_deps("a1", []),
+    ]
+    post_batch(client, events)
+    assert get_root_causes(client, "g").json()["root_causes"] == [
+        {"event_id": "a1", "path": ["g", "a1"]}
+    ]
+
+
+def test_root_causes_equal_length_paths_break_tie_by_full_id_sequence(client):
+    # g -> aa -> zz 与 g -> ab -> zz 等长；["g","aa","zz"] < ["g","ab","zz"]
+    events = [
+        event_with_deps("g", ["aa", "ab"]),
+        event_with_deps("aa", ["zz"]),
+        event_with_deps("ab", ["zz"]),
+        event_with_deps("zz", []),
+    ]
+    post_batch(client, events)
+    assert get_root_causes(client, "g").json()["root_causes"] == [
+        {"event_id": "zz", "path": ["g", "aa", "zz"]}
+    ]
+
+
+def test_root_causes_tie_break_deepest_difference_in_sequence(client):
+    # 目标 w 等长（4 边）路径到同一根因 r0，差异发生在第三跳：
+    # w -> p1 -> m2 -> x1 -> r0  vs  w -> p1 -> m1 -> x2 -> r0
+    # 第三跳 m1 < m2，故选含 m1 的整条序列
+    events = [
+        event_with_deps("w", ["p1"]),
+        event_with_deps("p1", ["m1", "m2"]),
+        event_with_deps("m1", ["x2"]),
+        event_with_deps("m2", ["x1"]),
+        event_with_deps("x1", ["r0"]),
+        event_with_deps("x2", ["r0"]),
+        event_with_deps("r0", []),
+    ]
+    post_batch(client, events)
+    assert get_root_causes(client, "w").json()["root_causes"] == [
+        {"event_id": "r0", "path": ["w", "p1", "m1", "x2", "r0"]}
+    ]
+
+
+def test_root_causes_tie_break_uses_full_sequence_not_first_hop_only(client):
+    # k -> b2 -> s1 与 k -> b1 -> s2 等长；第一跳 b1 小，但根因不同：
+    # s1 < s2，结果按根因 ID 排序，s1 在前且路径保留其（首跳较大的）整条序列
+    events = [
+        event_with_deps("k", ["b1", "b2"]),
+        event_with_deps("b1", ["s2"]),
+        event_with_deps("b2", ["s1"]),
+        event_with_deps("s1", []),
+        event_with_deps("s2", []),
+    ]
+    post_batch(client, events)
+    assert get_root_causes(client, "k").json()["root_causes"] == [
+        {"event_id": "s1", "path": ["k", "b2", "s1"]},
+        {"event_id": "s2", "path": ["k", "b1", "s2"]},
+    ]
+
+
+def test_root_causes_mixed_roots_and_merges_branch_once(client):
+    # t 依赖 u、v；u -> r1 与 u -> r2；v -> r2（与 u 的一条分支汇合）。
+    # 根因 r1 仅一条路径；r2 汇合只出现一次，等长路径按序列取 ["t","u","r2"]
+    events = [
+        event_with_deps("t", ["u", "v"]),
+        event_with_deps("u", ["r1", "r2"]),
+        event_with_deps("v", ["r2"]),
+        event_with_deps("r1", []),
+        event_with_deps("r2", []),
+    ]
+    post_batch(client, events)
+    assert get_root_causes(client, "t").json()["root_causes"] == [
+        {"event_id": "r1", "path": ["t", "u", "r1"]},
+        {"event_id": "r2", "path": ["t", "u", "r2"]},
+    ]
+
+
+def test_root_causes_direct_blocker_that_is_itself_ready_is_root(client):
+    # 与 /events/ready 语义一致：根因正是那些已就绪（无 pending 前置）的
+    # 直接/间接前置；确认全部根因后目标进入就绪队列
+    _chain(client, "c", "b", "a")
+    post_event(client, event_with_deps("d", ["a"]))  # d 同样被 a 阻塞
+    for eid in ("c", "d"):
+        assert [rc["event_id"] for rc in get_root_causes(client, eid).json()["root_causes"]] == ["a"]
+    client.post("/events/a/ack")
+    # d 只有 a 一个前置，现在可确认；c 仍被 b 阻塞
+    assert get_root_causes(client, "d").json()["confirmable"] is True
+    assert get_root_causes(client, "d").json()["root_causes"] == []
+    assert get_root_causes(client, "c").json()["root_causes"] == [
+        {"event_id": "b", "path": ["c", "b"]}
+    ]
+
+
+def test_root_causes_does_not_require_signature_headers(client):
+    post_event(client, event_with_deps("a", []))
+    # 与 GET /events/{id}、ack 一致：普通 GET 即可
+    r = client.get("/events/a/root-causes")
+    assert r.status_code == 200
+
+
+def test_store_get_blocking_roots(store):
+    store.create_event("a", "t", {}, source=SOURCE, nonce="br0")
+    store.create_event("b", "t", {}, source=SOURCE, nonce="br1", depends_on=["a"])
+    store.create_event(
+        "c", "t", {}, source=SOURCE, nonce="br2", depends_on=["b"]
+    )
+    result = store.get_blocking_roots("c")
+    assert result == {
+        "event_id": "c",
+        "status": "pending",
+        "confirmable": False,
+        "root_causes": [{"event_id": "a", "path": ["c", "b", "a"]}],
+    }
+    store.ack_event("a")
+    assert store.get_blocking_roots("c")["root_causes"] == [
+        {"event_id": "b", "path": ["c", "b"]}
+    ]
+    store.ack_event("b")
+    assert store.get_blocking_roots("c")["confirmable"] is True
+    store.ack_event("c")
+    assert store.get_blocking_roots("c") == {
+        "event_id": "c",
+        "status": "acked",
+        "confirmable": False,
+        "root_causes": [],
+    }
+    with pytest.raises(EventNotFoundError):
+        store.get_blocking_roots("nope")
+
+
 def test_store_ack_batch_rollback_on_missing(store):
     store.create_event("a", "t", {}, source=SOURCE, nonce="ab0")
     with pytest.raises(BatchAckNotFoundError) as exc:

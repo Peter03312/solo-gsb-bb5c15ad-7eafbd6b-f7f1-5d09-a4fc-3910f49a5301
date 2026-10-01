@@ -573,6 +573,93 @@ class EventStore:
             params.extend([c_created, c_created, c_id])
         return self._list_page(f"WHERE {' AND '.join(clauses)}", params, limit)
 
+    def get_blocking_roots(self, event_id: str) -> dict:
+        """追溯当前挡住 event_id 确认的“最上游未确认前置事件”（根因）。
+
+        只沿指向 pending 事件的依赖边追溯：已 ack 的前置不构成阻塞，其上游
+        也不再进入追溯范围。根因 = pending 可达子图中“自身没有 pending 前置”
+        的节点（目标自身除外）。每个根因附带一条从目标到它的路径（含两端）：
+        多条路径取边数最少者，等长时按整条 event_id 序列字典序取最小；汇合
+        分支的同一根因只出现一次，结果按根因 event_id 排序。落库图无环，
+        故每个可达 pending 节点沿 pending 边必能走到某个根因。
+
+        返回 {"event_id", "status", "confirmable", "root_causes"}；
+        root_causes 每项为 {"event_id", "path"}。事件不存在抛
+        EventNotFoundError；已确认事件不可再确认且根因为空，不再追溯。
+        """
+        with self.db.lock:
+            conn = self.db.conn
+            row = conn.execute(
+                "SELECT * FROM events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            if row is None:
+                raise EventNotFoundError(event_id)
+            if row["status"] == STATUS_ACKED:
+                return {
+                    "event_id": event_id,
+                    "status": STATUS_ACKED,
+                    "confirmable": False,
+                    "root_causes": [],
+                }
+
+            # 按“距目标边数”分层展开 pending 可达子图（BFS）：每层一次批量
+            # 读取依赖集合与前置状态，已 ack 的前置不进入下一层。best 记录
+            # 目标到各节点的（最短路，等长时字典序最小）路径；层内推进保证
+            # 处理下一层时，本层所有节点的 best 已在同层边的比较后定型。
+            statuses: dict[str, str] = {event_id: STATUS_PENDING}
+            best: dict[str, tuple[str, ...]] = {event_id: (event_id,)}
+            frontier = [event_id]
+            roots: list[str] = []
+            confirmable = False
+
+            while frontier:
+                dep_map = _dependencies_for(conn, frontier)
+                all_deps = {dep for deps in dep_map.values() for dep in deps}
+                unknown = sorted(all_deps - statuses.keys())
+                if unknown:
+                    placeholders = ", ".join("?" for _ in unknown)
+                    # 引用合法性已由入箱写事务保证，IN 结果必覆盖 unknown
+                    for r in conn.execute(
+                        f"SELECT event_id, status FROM events WHERE event_id IN ({placeholders})",
+                        unknown,
+                    ).fetchall():
+                        statuses[r["event_id"]] = r["status"]
+
+                next_layer: list[str] = []
+                for node in frontier:
+                    pending_deps = sorted(
+                        dep for dep in dep_map[node] if statuses.get(dep) == STATUS_PENDING
+                    )
+                    if not pending_deps:
+                        # 深度 0 是目标自身：无 pending 前置意味着可确认，
+                        # 但目标不是自己的根因；其余无 pending 前置者即根因。
+                        if node == event_id:
+                            confirmable = True
+                        else:
+                            roots.append(node)
+                        continue
+                    for dep in pending_deps:
+                        candidate = best[node] + (dep,)
+                        current = best.get(dep)
+                        if current is None:
+                            best[dep] = candidate
+                            next_layer.append(dep)
+                        elif candidate < current:
+                            # 等长（同层边）路径的字典序改进；不重新入层：
+                            # dep 在后续层展开时使用的就是定型后的 best。
+                            best[dep] = candidate
+                frontier = sorted(set(next_layer))
+
+            return {
+                "event_id": event_id,
+                "status": STATUS_PENDING,
+                "confirmable": confirmable,
+                "root_causes": [
+                    {"event_id": root, "path": list(best[root])}
+                    for root in sorted(roots)
+                ],
+            }
+
     def ack_event(self, event_id: str) -> dict:
         """确认单条事件。幂等：重复确认返回当前状态。
 
